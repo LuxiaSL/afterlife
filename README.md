@@ -12,6 +12,10 @@ A terminal screensaver that runs Conway's Game of Life on an infinite grid — w
 
 Cells are born cool indigo, age through violet and magenta, mature into warm amber, and burn white before they die. The universe extends beyond what you can see. Zoom out to prove it.
 
+<p align="center">
+  <img src="demo.gif" alt="afterlife demo" width="800">
+</p>
+
 ## Quick Start
 
 ```bash
