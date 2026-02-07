@@ -85,7 +85,7 @@ SPARKS = "▁▂▃▄▅▆▇█"
 MIN_ZOOM = -2   # 4× zoom out  (each terminal pixel = 4×4 grid cells)
 MAX_ZOOM = 2    # 4× zoom in   (each grid cell = 4×4 terminal pixels)
 ZOOM_LABELS: dict[int, str] = {
-    -2: "0.25x", -1: "0.5x", 0: "1x", 1: "2x", 2: "4x",
+    -2: "0.25x", -1: "0.50x", 0: " 1.0x", 1: " 2.0x", 2: " 4.0x",
 }
 
 # ── Pattern library ─────────────────────────────────────────────────────
