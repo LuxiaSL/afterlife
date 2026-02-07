@@ -1,0 +1,20 @@
+[project]
+name = "afterlife"
+version = "1.0.0"
+description = "An infinite cellular automaton screensaver with generative music, ghost trails, and existential musings"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.24",
+]
+
+[project.optional-dependencies]
+music = ["pyaudio>=0.2.13"]
+full = [
+    "scipy>=1.10",
+    "pyaudio>=0.2.13",
+]
+
+[project.scripts]
+life = "life:main"

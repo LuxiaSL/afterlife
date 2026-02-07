@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+
+# Runtime artifacts
+life_stats.csv
+snapshots.jsonl
+*.wav
+*.prof
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+
+# Claude Code
+.claude/
+
+# Virtual environments
+.venv/
+venv/
