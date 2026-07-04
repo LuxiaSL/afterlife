@@ -733,6 +733,9 @@ class InfiniteLife:
             (self.world_h, self.world_w), dtype=np.float32
         )
 
+        # Bounding box from last step() — reused by _calculate_target_zoom()
+        self._step_bbox: tuple[int, int, int, int] | None = None
+
         self._seed_initial()
 
     # ── Seeding ─────────────────────────────────────────────────────
@@ -799,47 +802,139 @@ class InfiniteLife:
 
         g = self.grid
 
-        # Neighbour count via convolution (toroidal wrap-around)
-        if _convolve is not None:
-            # Reuse pre-allocated input + output buffers (avoids per-frame allocations)
-            np.copyto(self._grid_i16, g)
-            _convolve(self._grid_i16, NEIGHBOR_KERNEL, output=self._neighbor_buf, mode="wrap")
-            n = self._neighbor_buf
+        # ── Compute bounding box of all active cells (alive + ghosts) ──
+        # Active cells have age != 0 (alive > 0, ghost < 0).
+        active_mask = self.age != 0
+        any_row = np.any(active_mask, axis=1)
+        any_col = np.any(active_mask, axis=0)
+
+        has_activity = np.any(any_row)
+        if has_activity:
+            row_indices = np.flatnonzero(any_row)
+            col_indices = np.flatnonzero(any_col)
+            by0 = int(row_indices[0])
+            by1 = int(row_indices[-1]) + 1
+            bx0 = int(col_indices[0])
+            bx1 = int(col_indices[-1]) + 1
+
+            # Expand by 2 cells (kernel radius 1 + birth margin 1). If the
+            # padded box would spill past a world edge, toroidal wrap-around
+            # comes into play and a zero-padded sub-region convolution would
+            # get the physics wrong (edge injections make this routine) —
+            # fall back to the full-world wrap path instead.
+            pad = 2
+            fits = (
+                by0 - pad >= 0 and by1 + pad <= self.world_h
+                and bx0 - pad >= 0 and bx1 + pad <= self.world_w
+            )
+            if fits:
+                by0 -= pad
+                by1 += pad
+                bx0 -= pad
+                bx1 += pad
+                bbox_area = (by1 - by0) * (bx1 - bx0)
+                world_area = self.world_h * self.world_w
+                use_bbox = bbox_area <= world_area // 2
+            else:
+                use_bbox = False
         else:
-            # Fallback: manual shift-and-add with np.roll for toroidal wrap
-            n = np.zeros_like(g, dtype=np.int16)
-            for dr in (-1, 0, 1):
-                for dc in (-1, 0, 1):
-                    if dr == 0 and dc == 0:
-                        continue
-                    n += np.roll(np.roll(g, -dr, axis=0), -dc, axis=1)
+            use_bbox = False
 
-        # Use zero-copy bool view of int8 grid (avoids g==0 / g==1 comparisons)
-        g_bool = g.view(np.bool_)
-        n_is_3 = n == 3
-        birth = ~g_bool & n_is_3
-        survive = g_bool & (n_is_3 | (n == 2))
+        # Store bbox for reuse by _calculate_target_zoom()
+        self._step_bbox = (by0, by1, bx0, bx1) if has_activity and use_bbox else None
 
-        # In-place grid update (birth/survive are mutually exclusive,
-        # so add their int8 views: 0+0=0, 1+0=1, 0+1=1)
-        np.add(birth.view(np.int8), survive.view(np.int8), out=self.grid)
-        # Age tracking with ghost trails: positive = alive, negative = recently dead
-        # Note: inner condition requires age < 0 to avoid turning never-alive
-        # empties (age==0) into false ghosts (0 > -GHOST_FRAMES was true → bug)
-        self.age = np.where(
-            survive, self.age + 1,
-            np.where(birth, 1,
-            np.where(self.age > 0, -1,  # just died → start ghost
-            np.where((self.age < 0) & (self.age > -GHOST_FRAMES), self.age - 1, 0)))
-        )
-        # Temporal smoothing: in-place ops avoid 3 large temporary allocations
-        np.copyto(self._age_f32_buf, self.age)  # int32 → float32
-        self._age_f32_buf *= 0.15
-        self.age_smooth *= 0.85
-        self.age_smooth += self._age_f32_buf
+        if use_bbox:
+            # ── Bounded convolution on active sub-region ──
+            g_region = g[by0:by1, bx0:bx1].astype(np.int16)
+
+            if _convolve is not None:
+                n_region = _convolve(g_region, NEIGHBOR_KERNEL, mode="constant", cval=0)
+            else:
+                rh, rw = g_region.shape
+                n_region = np.zeros((rh, rw), dtype=np.int16)
+                for dr in (-1, 0, 1):
+                    for dc in (-1, 0, 1):
+                        if dr == 0 and dc == 0:
+                            continue
+                        # Zero-padded shift instead of np.roll (no wrap needed)
+                        src_y0 = max(0, dr)
+                        src_y1 = rh + min(0, dr)
+                        src_x0 = max(0, dc)
+                        src_x1 = rw + min(0, dc)
+                        dst_y0 = max(0, -dr)
+                        dst_y1 = rh + min(0, -dr)
+                        dst_x0 = max(0, -dc)
+                        dst_x1 = rw + min(0, -dc)
+                        n_region[dst_y0:dst_y1, dst_x0:dst_x1] += g_region[src_y0:src_y1, src_x0:src_x1]
+
+            g_bool_r = g[by0:by1, bx0:bx1].view(np.bool_)
+            n_is_3 = n_region == 3
+            birth_r = ~g_bool_r & n_is_3
+            survive_r = g_bool_r & (n_is_3 | (n_region == 2))
+
+            # Write updated grid back into sub-region
+            np.add(birth_r.view(np.int8), survive_r.view(np.int8),
+                   out=self.grid[by0:by1, bx0:bx1])
+
+            # Age tracking on sub-region only
+            age_r = self.age[by0:by1, bx0:bx1]
+            self.age[by0:by1, bx0:bx1] = np.where(
+                survive_r, age_r + 1,
+                np.where(birth_r, 1,
+                np.where(age_r > 0, -1,
+                np.where((age_r < 0) & (age_r > -GHOST_FRAMES), age_r - 1, 0)))
+            )
+
+            # Temporal smoothing: decay full world (single multiply, cheap)
+            self.age_smooth *= 0.85
+            # Add contribution only within the region
+            age_f32_r = self.age[by0:by1, bx0:bx1].astype(np.float32)
+            age_f32_r *= 0.15
+            self.age_smooth[by0:by1, bx0:bx1] += age_f32_r
+        else:
+            # ── Full-world path (fallback for edge-touching or dense worlds) ──
+            # Neighbour count via convolution (toroidal wrap-around)
+            if _convolve is not None:
+                # Reuse pre-allocated input + output buffers (avoids per-frame allocations)
+                np.copyto(self._grid_i16, g)
+                _convolve(self._grid_i16, NEIGHBOR_KERNEL, output=self._neighbor_buf, mode="wrap")
+                n = self._neighbor_buf
+            else:
+                # Fallback: manual shift-and-add with np.roll for toroidal wrap
+                n = np.zeros_like(g, dtype=np.int16)
+                for dr in (-1, 0, 1):
+                    for dc in (-1, 0, 1):
+                        if dr == 0 and dc == 0:
+                            continue
+                        n += np.roll(np.roll(g, -dr, axis=0), -dc, axis=1)
+
+            # Use zero-copy bool view of int8 grid (avoids g==0 / g==1 comparisons)
+            g_bool = g.view(np.bool_)
+            n_is_3 = n == 3
+            birth = ~g_bool & n_is_3
+            survive = g_bool & (n_is_3 | (n == 2))
+
+            # In-place grid update (birth/survive are mutually exclusive,
+            # so add their int8 views: 0+0=0, 1+0=1, 0+1=1)
+            np.add(birth.view(np.int8), survive.view(np.int8), out=self.grid)
+            # Age tracking with ghost trails: positive = alive, negative = recently dead
+            # Note: inner condition requires age < 0 to avoid turning never-alive
+            # empties (age==0) into false ghosts (0 > -GHOST_FRAMES was true → bug)
+            self.age = np.where(
+                survive, self.age + 1,
+                np.where(birth, 1,
+                np.where(self.age > 0, -1,  # just died → start ghost
+                np.where((self.age < 0) & (self.age > -GHOST_FRAMES), self.age - 1, 0)))
+            )
+            # Temporal smoothing: in-place ops avoid 3 large temporary allocations
+            np.copyto(self._age_f32_buf, self.age)  # int32 → float32
+            self._age_f32_buf *= 0.15
+            self.age_smooth *= 0.85
+            self.age_smooth += self._age_f32_buf
+
         self.generation += 1
 
-        pop = int(self.grid.sum())
+        pop = int(np.count_nonzero(self.grid))
         self._cached_pop = pop
         self.pop_history.append(pop)
 
@@ -994,11 +1089,23 @@ class InfiniteLife:
 
     def _calculate_target_zoom(self) -> int:
         """Calculate optimal zoom level based on activity spread."""
+        # Every nonzero age lives inside the bbox recorded by step(), so
+        # restrict the scan to it (only spreads matter below, not absolute
+        # positions). Falls back to the full world when step() took the
+        # full-world path.
+        if self._step_bbox is not None:
+            by0, by1, bx0, bx1 = self._step_bbox
+            age_r = self.age[by0:by1, bx0:bx1]
+            grid_r = self.grid[by0:by1, bx0:bx1]
+        else:
+            age_r = self.age
+            grid_r = self.grid
+
         # Find recent activity (age 1-10) or fall back to all living cells
-        active = ((self.age >= 1) & (self.age <= 10)).astype(np.int32)
-        if active.sum() < 5:
-            active = self.grid.astype(np.int32)
-        if active.sum() == 0:
+        active = (age_r >= 1) & (age_r <= 10)
+        if np.count_nonzero(active) < 5:
+            active = grid_r != 0
+        if not np.any(active):
             return self.zoom_level
 
         ys, xs = np.nonzero(active)
