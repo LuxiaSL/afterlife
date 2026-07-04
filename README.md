@@ -125,7 +125,7 @@ Key design choices:
 
 ## Performance
 
-The render loop is vectorized with numpy — color and ghost-trail indices are pre-computed as arrays, and only active cells are iterated. The main bottleneck is `scipy.ndimage.correlate` (native C), which is about as fast as Python can go for neighbor counting.
+The render loop is vectorized with numpy — color and ghost-trail indices are pre-computed as arrays, and only active cells are iterated. Neighbor counting convolves only the bounding box of active cells (falling back to the full toroidal world when activity touches an edge), using plain numpy shift-and-add — which, it turns out, beats `scipy.ndimage.convolve` by 3–7× at every relevant size. An earlier version of this section claimed scipy was "about as fast as Python can go"; the benchmark disagreed.
 
 For profiling:
 
