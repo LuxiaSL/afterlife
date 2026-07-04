@@ -183,6 +183,12 @@ TRAVELLERS = ["glider", "lwss", "hwss"]
 METHUSELAHS = ["r_pentomino", "acorn", "diehard", "pi_heptomino", "b_heptomino"]
 OSCILLATORS = ["pulsar", "pentadecathlon"]
 
+# Glider travel direction per _place() rotation (verified empirically:
+# one cell diagonally per 4 generations)
+GLIDER_DIR: dict[int, tuple[int, int]] = {
+    0: (1, 1), 1: (1, -1), 2: (-1, -1), 3: (-1, 1),
+}
+
 # ── Pattern census ──────────────────────────────────────────────────────
 # The simulation periodically identifies the famous citizens living in the
 # viewport (spaceships, oscillators, and the common still-life ash) so the
@@ -967,9 +973,15 @@ class InfiniteLife:
 
         # Pattern census: sightings of known patterns in the viewport
         self.last_census: dict[str, int] = {}
+        self.last_census_sites: list[tuple[str, int, int]] = []  # (name, wy, wx)
         self._sighting_gen: dict[str, int] = {}   # per-pattern last announce
         self._sighting_count: dict[str, int] = {}  # per-pattern musing rotation
         self._last_sighting_gen: int = -(10**9)
+
+        # Dramaturge: while a staged plot (aimed gliders) is in flight,
+        # cycle/stagnation injections hold their breath until this
+        # generation. The population floor stays armed — it's life support.
+        self._drama_until: int = 0
 
         self._seed_initial()
 
@@ -1256,20 +1268,33 @@ class InfiniteLife:
                     break
 
         # ── Act ──
+        # While a staged plot is in flight (aimed gliders travelling),
+        # cycle/stagnation responses hold their breath and let it arrive.
+        # The population floor stays armed — it's life support, not drama.
+        drama_pending = self.generation < self._drama_until
+
         event = ""
         if population < self.pop_floor // 3:
             event = "inject:massive"
             self._inject("massive")
-        elif population < self.pop_floor or self.cycle_period > 0:
-            kind = "heavy"
-            if self.cycle_period > 0:
-                event = f"inject:heavy(cycle={self.cycle_period})"
+        elif population < self.pop_floor:
+            event = "inject:heavy(low_pop)"
+            self._inject("heavy")
+        elif self.cycle_period > 0 and not drama_pending:
+            # An attractor: prefer assassination over carpet-bombing.
+            target = self._inject_provoke() if random.random() < 0.65 else ""
+            if target:
+                event = f"inject:provoke(cycle={self.cycle_period},{target})"
             else:
-                event = "inject:heavy(low_pop)"
-            self._inject(kind)
-        elif stagnant:
-            event = "inject:medium(stagnant)"
-            self._inject("medium")
+                event = f"inject:heavy(cycle={self.cycle_period})"
+                self._inject("heavy")
+        elif stagnant and not drama_pending:
+            # Quiet stretch: stage a collision instead of dumping mass.
+            if random.random() < 0.7 and self._inject_collide():
+                event = "inject:collide(stagnant)"
+            else:
+                event = "inject:medium(stagnant)"
+                self._inject("medium")
         elif self.generation % 5000 == 0 and self.generation > 0:
             # Rare garden event — a beautiful symmetric pattern appears
             event = "inject:garden"
@@ -1287,9 +1312,6 @@ class InfiniteLife:
         return event
 
     def _inject(self, intensity: str = "medium") -> None:
-        cy = self.cam_y + self.view_h // 2
-        cx = self.cam_x + self.view_w // 2
-
         counts = {"massive": 8, "heavy": 5, "medium": 3}
         n = counts.get(intensity, 3)
 
@@ -1301,13 +1323,15 @@ class InfiniteLife:
             else:
                 name = random.choice(TRAVELLERS + OSCILLATORS)
 
-            y = cy + random.randint(-self.view_h // 3, self.view_h // 3)
-            x = cx + random.randint(-self.view_w // 3, self.view_w // 3)
+            # New life blooms where it's darkest (jitter breaks the
+            # block-grid regularity of the void finder)
+            y, x = self._find_quiet_spot()
+            y += random.randint(-6, 6)
+            x += random.randint(-6, 6)
             self._place(name, y, x)
 
         if intensity in ("massive", "heavy"):
-            y = cy + random.randint(-self.view_h // 4, self.view_h // 4)
-            x = cx + random.randint(-self.view_w // 4, self.view_w // 4)
+            y, x = self._find_quiet_spot()
             self._place("gosper_gun", y, x)
 
     def _inject_from_edge(self) -> None:
@@ -1339,6 +1363,124 @@ class InfiniteLife:
             if 0 <= ny < self.world_h and 0 <= nx < self.world_w:
                 self.grid[ny, nx] = 1
                 self.age[ny, nx] = 1
+
+    # ── Dramaturge ──────────────────────────────────────────────────
+    # Injections with intention. The engine reads the activity field and
+    # the census, then composes events instead of rolling dice: new life
+    # blooms in the darkest visible void, assassins are aimed at named
+    # citizens, collisions are scheduled in the quiet.
+
+    def _find_quiet_spot(self) -> tuple[int, int]:
+        """Pick a low-occupancy, low-activity spot in the visible region.
+
+        Block-reduces occupancy + activity over the current zoom cover and
+        chooses randomly among the darkest quintile, so revivals bloom in
+        the void where there's room to watch them grow.
+        """
+        cy, cx = self._view_center()
+        factor = 1 << (-self.zoom_level) if self.zoom_level < 0 else 1
+        cover_h = min(self.world_h, self.view_h * factor)
+        cover_w = min(self.world_w, self.view_w * factor)
+        y0 = max(0, min(cy - cover_h // 2, self.world_h - cover_h))
+        x0 = max(0, min(cx - cover_w // 2, self.world_w - cover_w))
+
+        B = 16
+        bh, bw = cover_h // B, cover_w // B
+        if bh < 2 or bw < 2:
+            return cy, cx
+
+        occ = (
+            self.grid[y0 : y0 + bh * B, x0 : x0 + bw * B]
+            .reshape(bh, B, bw, B).sum(axis=(1, 3)).astype(np.float32)
+        )
+        act = (
+            self.activity[y0 : y0 + bh * B, x0 : x0 + bw * B]
+            .reshape(bh, B, bw, B).sum(axis=(1, 3))
+        )
+        score = occ * 2.0 + act
+
+        flat = score.ravel()
+        k = max(1, flat.size // 5)
+        darkest = np.argpartition(flat, k - 1)[:k]
+        pick = int(random.choice(darkest.tolist()))
+        by, bx = divmod(pick, bw)
+        return y0 + by * B + B // 2, x0 + bx * B + B // 2
+
+    def _aim_glider(self, ty: int, tx: int, dist: int, rot: int) -> bool:
+        """Place a glider `dist` cells out, aimed to pass through (ty, tx).
+
+        The origin must sit inside the raw viewport (so the staging itself
+        breaks any viewport-hash cycle) with a clear launch pad. Returns
+        True on placement; ETA is dist * 4 generations.
+        """
+        dy, dx = GLIDER_DIR[rot]
+        oy, ox = ty - dy * dist, tx - dx * dist
+        vy0, vx0 = self._clamp_cam()
+        if not (vy0 + 2 <= oy < vy0 + self.view_h - 5
+                and vx0 + 2 <= ox < vx0 + self.view_w - 5):
+            return False
+        pad = self.grid[max(0, oy - 2) : oy + 5, max(0, ox - 2) : ox + 5]
+        if int(pad.sum()) > 0:
+            return False
+        self._place("glider", oy, ox, rotation=rot)
+        return True
+
+    def _inject_provoke(self) -> str:
+        """Aim a glider at a named citizen (rarest first). Returns the
+        target's name, or "" if no shot lined up."""
+        sites = list(self.last_census_sites)
+        if not sites:
+            return ""
+        sites.sort(key=lambda s: -SIGHTING_RARITY.get(s[0], 0))
+        # Consider the most notable few, in order
+        for name, ty, tx in sites[:6]:
+            dist = random.randint(35, 60)
+            rots = list(range(4))
+            random.shuffle(rots)
+            for rot in rots:
+                if self._aim_glider(ty, tx, dist, rot):
+                    self._drama_until = self.generation + dist * 4 + 150
+                    self.ticker.queue_special("the cosmos takes aim")
+                    return name
+        return ""
+
+    def _inject_collide(self) -> bool:
+        """Stage a head-on glider collision at a quiet visible spot."""
+        ty, tx = self._find_quiet_spot()
+        vy0, vx0 = self._clamp_cam()
+
+        for _ in range(6):
+            # Pick the throw distance first, then clamp the meeting point
+            # into the band where both launch pads provably fit inside
+            # the viewport (origins sit at target ∓ dist on each axis).
+            dist = random.randint(16, 34)
+            lo_y, hi_y = vy0 + dist + 3, vy0 + self.view_h - dist - 6
+            lo_x, hi_x = vx0 + dist + 3, vx0 + self.view_w - dist - 6
+            if lo_y >= hi_y or lo_x >= hi_x:
+                continue  # viewport too small for this throw
+            ty = max(lo_y, min(ty, hi_y))
+            tx = max(lo_x, min(tx, hi_x))
+            rot = random.randint(0, 3)
+            # Jitter varies the collision outcome; right-angle approaches
+            # (rot ± 1) explode far more often than head-on (rot + 2),
+            # which mostly annihilates quietly — measured 14/49 vs 1/49
+            # explosion geometries.
+            jy = random.randint(-3, 3)
+            jx = random.randint(-3, 3)
+            if not self._aim_glider(ty, tx, dist, rot):
+                continue
+            # First glider is in flight; try to give it a partner.
+            # (If none fits, a lone glider crossing the quiet is still
+            # a scene — keep the appointment either way.)
+            partner_rot = (rot + random.choice((1, 3))) % 4
+            paired = self._aim_glider(ty + jy, tx + jx, dist, partner_rot)
+            self._drama_until = self.generation + dist * 4 + 150
+            self.ticker.queue_special(
+                "two gliders, one appointment" if paired
+                else "a lone glider, sent into the dark"
+            )
+            return True
+        return False
 
     # ── Camera ──────────────────────────────────────────────────────
 
@@ -1725,16 +1867,20 @@ class InfiniteLife:
             return {}
         occupied = vg != 0
         if not occupied.any():
+            self.last_census_sites = []
             return {}
 
         try:
             merged = _binary_dilation(occupied, iterations=2)
             labels, n_lab = _nd_label(merged, structure=np.ones((3, 3), dtype=np.int8))
             if n_lab == 0 or n_lab > 400:
+                self.last_census_sites = []
                 return {}
 
+            vy0, vx0 = self._clamp_cam()  # viewport origin in world coords
             sigs = _get_census_signatures()
             counts: dict[str, int] = {}
+            sites: list[tuple[str, int, int]] = []
             for i, sl in enumerate(_find_objects(labels), start=1):
                 if sl is None:
                     continue
@@ -1749,6 +1895,14 @@ class InfiniteLife:
                 name = sigs.get(_canonical_signature(_crop_to_bbox(cluster)))
                 if name is not None:
                     counts[name] = counts.get(name, 0) + 1
+                    if len(sites) < 48:
+                        cys, cxs = np.nonzero(cluster)
+                        sites.append((
+                            name,
+                            vy0 + sl[0].start + int(cys.mean()),
+                            vx0 + sl[1].start + int(cxs.mean()),
+                        ))
+            self.last_census_sites = sites
             return counts
         except Exception:
             return {}  # the census must never crash the sim
