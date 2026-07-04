@@ -36,6 +36,8 @@ rather have a fresh genesis.
 
 The simulation seeds itself with classic Game of Life patterns — gliders, spaceships, methuselahs, oscillators — and lets them collide on a toroidal grid that's much larger than your terminal. A population floor adapts as civilizations grow, injecting new structures when things get too quiet. The universe names its own epochs (*genesis*, *primordial*, *emergence*, ...) and reacts to its own mood.
 
+It also senses itself: a decaying **activity field** tracks where cells are being born and dying. The camera steers toward the drama. Injections read the field and compose events instead of rolling dice — new life blooms in the darkest visible void, detected attractors get a glider aimed at their most notable citizen (*the cosmos takes aim*), and stagnant stretches are answered with a scheduled collision (*two gliders, one appointment*) while the engine patiently holds its other interventions until the plot arrives. Time itself breathes: the frame clock stretches into slow motion when activity spikes and hurries through the calm.
+
 A news ticker scrolls context-aware musings across the bottom of the screen:
 
 > *the math dreams itself*

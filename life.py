@@ -985,6 +985,10 @@ class InfiniteLife:
         # generation. The population floor stays armed — it's life support.
         self._drama_until: int = 0
 
+        # Time dilation: activity baseline (EMA) and smoothed tempo factor
+        self._act_baseline: float = 0.0
+        self._dilation: float = 1.0
+
         self._seed_initial()
 
     # ── Seeding ─────────────────────────────────────────────────────
@@ -2163,6 +2167,36 @@ class InfiniteLife:
         region = self.activity[y0 : y0 + self.view_h, x0 : x0 + self.view_w]
         return float(region.sum())
 
+    def time_dilation(self) -> float:
+        """Frame-delay factor: > 1 savors drama, < 1 hurries the calm.
+
+        Compares viewport activity against its own long-run baseline
+        (EMA), so "dramatic" is always relative to this universe's normal.
+        Call once per frame; disabled while the user drives the camera.
+        """
+        if not self.auto_cam:
+            return 1.0
+        act = self.viewport_activity()
+        if self._act_baseline <= 0.0:
+            self._act_baseline = max(act, 1.0)
+            return 1.0
+        # Asymmetric baseline: rises fast (a burst is savored briefly,
+        # then absorbed as the new normal), decays slow (a lull reads as
+        # fast-forward until it becomes the new normal). Drama is always
+        # a *change*, relative to this universe's own recent history.
+        alpha = 0.015 if act > self._act_baseline else 0.003
+        self._act_baseline = self._act_baseline * (1.0 - alpha) + act * alpha
+        ratio = act / max(self._act_baseline, 1.0)
+        if ratio > 1.0:
+            target = min(1.6, 1.0 + (ratio - 1.0) * 0.7)  # slow-mo spike
+        else:
+            target = 0.7 + ratio * 0.3  # drift faster through the calm
+        if act < 60.0:
+            target = min(target, 0.7)  # near-dead viewport: don't linger
+        # Smooth the factor itself so tempo never jitters
+        self._dilation = self._dilation * 0.85 + target * 0.15
+        return self._dilation
+
     def sparkline(self, width: int = 24) -> str:
         ph_len = len(self.pop_history)
         if ph_len < 2:
@@ -2410,7 +2444,7 @@ def _draw_stats_overlay(
         census_str = "none"
 
     panel_w = 36
-    panel_h = 10
+    panel_h = 11
     x0 = max_x - panel_w - 2
     y0 = max_y - panel_h - 2
 
@@ -2428,6 +2462,7 @@ def _draw_stats_overlay(
         f"   @ gen     : {life.last_event_gen:,}" if life.last_event else "               ",
         f" world       : {life.world_h}x{life.world_w}",
         f" census      : {census_str[: panel_w - 16]}",
+        f" tempo       : {1.0 / max(life._dilation, 0.01):.2f}x",
     ]
 
     style = curses.A_DIM
@@ -2678,7 +2713,8 @@ def main(stdscr: curses.window) -> None:
                    music_status=_music_status)
             stdscr.refresh()
 
-            time.sleep(life.delay / 1000.0)
+            # Time breathes: savor catastrophes, hurry through the calm
+            time.sleep(life.delay * life.time_dilation() / 1000.0)
 
     finally:
         life.save(UNIVERSE_PATH)
