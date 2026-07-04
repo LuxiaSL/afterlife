@@ -25,6 +25,10 @@ python3 life.py
 
 That's it. Press `q` to leave. If you can't.
 
+The universe is saved when you quit (`universe.npz`) and resumes where it
+left off next launch — it's a place, not a session. Press `r` if you'd
+rather have a fresh genesis.
+
 > `scipy` and `pyaudio` are optional — the simulation runs fine without them,
 > just with no pattern census and no music.
 

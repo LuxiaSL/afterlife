@@ -727,6 +727,8 @@ GARDENS: list[list[tuple[int, int]]] = [
 ]
 
 LOG_PATH = Path(__file__).resolve().parent / "life_stats.csv"
+UNIVERSE_PATH = Path(__file__).resolve().parent / "universe.npz"
+AUTOSAVE_EVERY = 5000  # generations between autosaves (plus save on quit)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -1940,6 +1942,87 @@ class InfiniteLife:
         self._sighting_gen[best_name] = self.generation
         self._last_sighting_gen = self.generation
 
+    # ── Persistence ─────────────────────────────────────────────────
+    # The universe is a place, not a session: state survives quitting.
+
+    def save(self, path: Path) -> bool:
+        """Atomically save the universe. Returns True on success."""
+        tmp = path.parent / (path.name + ".tmp")
+        try:
+            with open(tmp, "wb") as f:
+                np.savez_compressed(
+                    f,
+                    grid=self.grid,
+                    age=self.age,
+                    generation=np.int64(self.generation),
+                    total_injections=np.int64(self.total_injections),
+                )
+            tmp.replace(path)
+            return True
+        except OSError:
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return False
+
+    def adopt(
+        self,
+        grid: NDArray[np.int8],
+        age: NDArray[np.int32],
+        generation: int,
+        total_injections: int,
+    ) -> None:
+        """Adopt a prior universe's state (resume or terminal resize).
+
+        The old world is embedded centered; whatever doesn't fit is
+        cropped. Derived state (smoothing, activity, histories) warms
+        back up within a few dozen generations.
+        """
+        sh, sw = grid.shape
+        h = min(self.world_h, sh)
+        w = min(self.world_w, sw)
+        sy, sx = (sh - h) // 2, (sw - w) // 2
+        dy, dx = (self.world_h - h) // 2, (self.world_w - w) // 2
+
+        self.grid[:] = 0
+        self.age[:] = 0
+        self.grid[dy : dy + h, dx : dx + w] = grid[sy : sy + h, sx : sx + w]
+        self.age[dy : dy + h, dx : dx + w] = age[sy : sy + h, sx : sx + w]
+        # Retire ghosts deeper than normal decay can reach (haunted-mode
+        # ages, or a future format change) — they'd be stuck forever
+        self.age[self.age < -GHOST_FRAMES] = 0
+
+        self.generation = int(generation)
+        self.total_injections = int(total_injections)
+        self.age_smooth[:] = 0
+        self.activity[:] = 0
+        self.pop_history.clear()
+        self.hash_history.clear()
+        self._cached_pop = int(np.count_nonzero(self.grid))
+        self.pop_history.append(self._cached_pop)
+        self._disp_grid_cache = None
+        self._disp_age_cache = None
+        self._step_bbox = None
+        self._drama_until = 0
+
+    def resume(self, path: Path) -> bool:
+        """Load a saved universe if one exists. Returns True on success."""
+        try:
+            if not path.exists():
+                return False
+            with np.load(path) as data:
+                grid = data["grid"].astype(np.int8)
+                age = data["age"].astype(np.int32)
+                generation = int(data["generation"])
+                total_injections = int(data["total_injections"])
+            if grid.ndim != 2 or grid.shape != age.shape or generation < 0:
+                return False
+            self.adopt(grid, age, generation, total_injections)
+            return True
+        except Exception:
+            return False  # corrupt or foreign file → fresh universe
+
     def toggle_haunted(self) -> None:
         """Toggle haunted mode (the resurrected ghost-decay bug)."""
         self.haunted = not self.haunted
@@ -2374,6 +2457,12 @@ def main(stdscr: curses.window) -> None:
     max_y, max_x = stdscr.getmaxyx()
     life = InfiniteLife(max_y - 1, max_x)
 
+    # The universe is a place: pick up where the last session left off
+    if life.resume(UNIVERSE_PATH):
+        life.ticker.queue_special(
+            f"the universe remembers generation {life.generation:,}"
+        )
+
     logger = StatsLogger(LOG_PATH)
     logger.open()
 
@@ -2479,10 +2568,13 @@ def main(stdscr: curses.window) -> None:
                 except curses.error:
                     pass
             elif key == curses.KEY_RESIZE:
+                # Resize the vessel, keep the universe
                 max_y, max_x = stdscr.getmaxyx()
-                was_haunted = life.haunted
+                old = life
                 life = InfiniteLife(max_y - 1, max_x)
-                life.haunted = was_haunted
+                life.haunted = old.haunted
+                life.adopt(old.grid, old.age, old.generation,
+                           old.total_injections)
                 _playhead_col_idx = 0
 
             # ── Simulate ───────────────────────────────────────────
@@ -2558,6 +2650,11 @@ def main(stdscr: curses.window) -> None:
                     and life.generation % 150 == 0):
                 life.take_census()
 
+            # ── Autosave (crash insurance; main save happens on quit) ──
+            if (not life.paused and life.generation > 0
+                    and life.generation % AUTOSAVE_EVERY == 0):
+                life.save(UNIVERSE_PATH)
+
             # ── Log ────────────────────────────────────────────────
             if event or life.generation % 10 == 0:
                 logger.log(
@@ -2584,6 +2681,7 @@ def main(stdscr: curses.window) -> None:
             time.sleep(life.delay / 1000.0)
 
     finally:
+        life.save(UNIVERSE_PATH)
         if music is not None:
             try:
                 music.stop()
