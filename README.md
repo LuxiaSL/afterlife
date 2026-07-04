@@ -69,6 +69,10 @@ The simulation *sonifies itself*. A generative music engine reads the grid state
 - **Arpeggio** — broken chords that thicken when the population is dense
 - **Noise** — percussive bursts on population spikes
 
+The output is **stereo**: the melody pans with the playhead as it sweeps the viewport, so you can hear *where* the grid is alive; the arpeggio drifts slowly across the field on its own. (Falls back to mono if the audio device insists.)
+
+And when the simulation detects that the universe has settled into a cycle, it breaks the attractor with an injection — but not before the music **resolves**: a small cadence descends octave → fifth → root and rings out as the new chaos arrives. Death of an attractor deserves scoring.
+
 Two styles are available — **chiptune** (square waves, NES nostalgia) and **ambient** (sine waves, reverb-like decay). Press `v` to switch. Press `m` to mute.
 
 Music requires `pyaudio` (and a working audio device). If unavailable, the simulation runs silently.

@@ -60,6 +60,12 @@ SCALES: dict[str, tuple[int, ...]] = {
 }
 
 # Mood → scale name
+# ── Cadence (played when a detected attractor is broken) ──────────────
+# A short resolving gesture — octave, fifth, root — before the new chaos
+# arrives. Death of an attractor deserves scoring.
+CADENCE_VOLUME: float = 0.22
+CADENCE_COOLDOWN_S: float = 20.0
+
 MOOD_SCALE: dict[str, str] = {
     "booming":   "lydian",
     "declining": "aeolian",
@@ -115,6 +121,7 @@ class SimulationSnapshot:
     playhead_column: tuple[bool, ...] = ()
     playhead_position: float = 0.0
     viewport_rows: int = 40
+    event: str = ""  # last injection event string ("" = none this frame)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -541,6 +548,21 @@ class LifeMusicEngine:
         self._lpf_arp: CachedLPF = CachedLPF(4500.0)
         self._lpf_noise: CachedLPF = CachedLPF(600.0)
 
+        # Stereo output (falls back to mono if the device refuses 2ch).
+        # Melody pans with the playhead; arpeggio drifts on a slow LFO.
+        self._channels: int = 2
+        self._prev_melody_pan: float = 0.5
+        self._prev_arp_pan: float = 0.5
+        self._autopan_phase: float = 0.0
+
+        # Cadence: resolving gesture when a detected cycle is broken.
+        # Sequence of (freq_hz, duration_samples); idx -1 = inactive.
+        self._cadence_voice: Voice = Voice(style=self._style)
+        self._cadence_seq: list[tuple[float, int]] = []
+        self._cadence_idx: int = -1
+        self._cadence_remaining: int = 0
+        self._cadence_cooldown: int = 0  # samples until next trigger allowed
+
     # ── Public properties ──────────────────────────────────────────────
 
     @property
@@ -576,30 +598,44 @@ class LifeMusicEngine:
         for v in self._melody_voices:
             v.style = self._style
         self._arp_voice.style = self._style
+        self._cadence_voice.style = self._style
 
     # ── Lifecycle ──────────────────────────────────────────────────────
 
     def start(self) -> bool:
-        """Start audio output. Returns True on success, False on failure."""
+        """Start audio output. Returns True on success, False on failure.
+
+        Prefers stereo (melody pans with the playhead); falls back to a
+        mono stream if the output device refuses two channels.
+        """
         if not _HAS_PYAUDIO:
             return False
 
         try:
             self._pa = pyaudio.PyAudio()
-            self._stream = self._pa.open(
-                format=pyaudio.paFloat32,
-                channels=1,
-                rate=SAMPLE_RATE,
-                output=True,
-                frames_per_buffer=BUFFER_SIZE,
-                stream_callback=self._audio_callback,
-            )
-            self._stream.start_stream()
-            self._running = True
-            return True
         except Exception:
-            self._cleanup_audio()
+            self._pa = None
             return False
+
+        for channels in (2, 1):
+            try:
+                self._channels = channels
+                self._stream = self._pa.open(
+                    format=pyaudio.paFloat32,
+                    channels=channels,
+                    rate=SAMPLE_RATE,
+                    output=True,
+                    frames_per_buffer=BUFFER_SIZE,
+                    stream_callback=self._audio_callback,
+                )
+                self._stream.start_stream()
+                self._running = True
+                return True
+            except Exception:
+                self._stream = None
+
+        self._cleanup_audio()
+        return False
 
     def stop(self) -> None:
         """Stop audio output and clean up resources."""
@@ -687,6 +723,25 @@ class LifeMusicEngine:
         # ── Tempo ──
         ms.tempo_bpm = lerp(60.0, 120.0, min(1.0, snapshot.density * 8.0))
 
+        # ── Cadence: score the death of an attractor ──
+        # The sim breaks detected cycles with an injection; before the new
+        # chaos registers, resolve — octave, fifth, root, ringing out.
+        if (
+            snapshot.event.startswith("inject")
+            and "cycle" in snapshot.event
+            and self._cadence_idx < 0
+            and self._cadence_cooldown <= 0
+        ):
+            base = ms.target_root_midi + 12  # melody register
+            self._cadence_seq = [
+                (midi_to_hz(base + 12), int(0.4 * SAMPLE_RATE)),
+                (midi_to_hz(base + 7), int(0.4 * SAMPLE_RATE)),
+                (midi_to_hz(base), int(2.0 * SAMPLE_RATE)),
+            ]
+            self._cadence_remaining = 0
+            self._cadence_cooldown = int(CADENCE_COOLDOWN_S * SAMPLE_RATE)
+            self._cadence_idx = 0  # written last: audio thread reads it as the gate
+
     def _compute_playhead_notes(self, snap: SimulationSnapshot,
                                 ms: MusicalState) -> None:
         """Map alive cells in the playhead column to pitches."""
@@ -739,7 +794,7 @@ class LifeMusicEngine:
     ) -> tuple[bytes, int]:
         """PyAudio stream callback. Generates audio samples."""
         if not self._running:
-            silence = b'\x00' * (frame_count * 4)
+            silence = b'\x00' * (frame_count * 4 * self._channels)
             return (silence, pyaudio.paComplete)
 
         # Track buffer underruns (output underflow = PortAudio ran out of data)
@@ -747,9 +802,15 @@ class LifeMusicEngine:
             self._underrun_count += 1
 
         try:
-            samples = self._render_buffer(frame_count)
+            if self._channels == 2:
+                left, right = self._render_stereo(frame_count)
+                samples = np.empty(frame_count * 2, dtype=np.float32)
+                samples[0::2] = left
+                samples[1::2] = right
+            else:
+                samples = self._render_buffer(frame_count)
         except Exception:
-            samples = np.zeros(frame_count, dtype=np.float32)
+            samples = np.zeros(frame_count * self._channels, dtype=np.float32)
 
         # Apply master volume and mute
         if self._muted:
@@ -763,11 +824,19 @@ class LifeMusicEngine:
         self._buffer_count += 1
         return (samples.tobytes(), pyaudio.paContinue)
 
-    def _render_buffer(self, n_samples: int) -> NDArray[np.float32]:
-        """Mix all voice layers into a single buffer."""
+    def _render_layers(
+        self, n_samples: int
+    ) -> tuple[
+        NDArray[np.float32], NDArray[np.float32], NDArray[np.float32],
+        NDArray[np.float32], NDArray[np.float32] | None,
+        tuple[NDArray[np.float32], NDArray[np.float32],
+              NDArray[np.float32], NDArray[np.float32]],
+    ]:
+        """Render all layers + per-sample volume ramps (shared by the mono
+        and stereo mix paths). Returns (drone, melody, arp, noise, cadence,
+        (drone_ramp, melody_ramp, arp_ramp, noise_ramp))."""
         # Read snapshot atomically (GIL guarantees)
         ms = self._musical
-        snap = self._snapshot
 
         dt = n_samples / SAMPLE_RATE
 
@@ -822,6 +891,16 @@ class LifeMusicEngine:
         melody = self._render_melody(n_samples, dt)
         arp = self._render_arpeggio(n_samples, dt)
         noise = self._render_noise(n_samples, dt)
+        cadence = self._render_cadence(n_samples)
+
+        return drone, melody, arp, noise, cadence, (
+            drone_ramp, melody_ramp, arp_ramp, noise_ramp,
+        )
+
+    def _render_buffer(self, n_samples: int) -> NDArray[np.float32]:
+        """Mix all voice layers into a single mono buffer."""
+        drone, melody, arp, noise, cadence, ramps = self._render_layers(n_samples)
+        drone_ramp, melody_ramp, arp_ramp, noise_ramp = ramps
 
         # Mix with per-sample volume ramps (click-free transitions)
         mix = (
@@ -830,8 +909,76 @@ class LifeMusicEngine:
             + arp * arp_ramp
             + noise * noise_ramp
         )
+        if cadence is not None:
+            mix += cadence * np.float32(CADENCE_VOLUME)
 
         return mix
+
+    def _render_stereo(
+        self, n_samples: int
+    ) -> tuple[NDArray[np.float32], NDArray[np.float32]]:
+        """Mix all layers into left/right buffers.
+
+        The melody pans with the playhead as it sweeps the viewport, so
+        the grid is spatially audible; the arpeggio drifts on a slow LFO.
+        Drone, noise, and cadence stay centered. Constant-power panning,
+        with per-sample gain ramps so pan moves never click.
+        """
+        drone, melody, arp, noise, cadence, ramps = self._render_layers(n_samples)
+        drone_ramp, melody_ramp, arp_ramp, noise_ramp = ramps
+
+        # Pan targets (0 = hard left, 1 = hard right)
+        melody_pan = min(1.0, max(0.0, self._snapshot.playhead_position))
+        self._autopan_phase = (
+            self._autopan_phase + TWO_PI * n_samples / SAMPLE_RATE / 13.0
+        ) % TWO_PI
+        arp_pan = 0.5 + 0.35 * math.sin(self._autopan_phase)
+
+        # Constant-power gain ramps from the previous buffer's pan position
+        half_pi = math.pi / 2.0
+        mel_theta = np.linspace(self._prev_melody_pan, melody_pan,
+                                n_samples, dtype=np.float32) * half_pi
+        arp_theta = np.linspace(self._prev_arp_pan, arp_pan,
+                                n_samples, dtype=np.float32) * half_pi
+        self._prev_melody_pan = melody_pan
+        self._prev_arp_pan = arp_pan
+
+        melody_v = melody * melody_ramp
+        arp_v = arp * arp_ramp
+        center = drone * drone_ramp + noise * noise_ramp
+        if cadence is not None:
+            center = center + cadence * np.float32(CADENCE_VOLUME)
+        center *= np.float32(0.7071)  # constant-power center
+
+        left = center + melody_v * np.cos(mel_theta) + arp_v * np.cos(arp_theta)
+        right = center + melody_v * np.sin(mel_theta) + arp_v * np.sin(arp_theta)
+        return left, right
+
+    def _render_cadence(self, n_samples: int) -> NDArray[np.float32] | None:
+        """Render the resolving cadence voice, or None while inactive."""
+        if self._cadence_cooldown > 0:
+            self._cadence_cooldown -= n_samples
+        if self._cadence_idx < 0:
+            return None
+
+        if self._cadence_remaining <= 0:
+            if self._cadence_idx < len(self._cadence_seq):
+                freq, dur = self._cadence_seq[self._cadence_idx]
+                if self._cadence_idx == 0:
+                    self._cadence_voice.note_on(freq)
+                else:
+                    # Legato slide down the resolution (no envelope restart)
+                    self._cadence_voice.retrigger(freq)
+                self._cadence_remaining = dur
+                self._cadence_idx += 1
+            elif self._cadence_voice.gate:
+                self._cadence_voice.note_off()  # let the release ring out
+            elif not self._cadence_voice.active:
+                self._cadence_idx = -1  # tail finished
+                return None
+
+        self._cadence_remaining -= n_samples
+        return self._cadence_voice.render(n_samples)
 
     def render_buffer_separated(self, n_samples: int) -> LayeredRender:
         """Render all layers and return them separately (diagnostic use).

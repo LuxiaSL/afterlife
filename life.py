@@ -2293,6 +2293,7 @@ def main(stdscr: curses.window) -> None:
                         playhead_column=col_data,
                         playhead_position=playhead_pos,
                         viewport_rows=disp.shape[0],
+                        event=event,
                     )
                     music.update(snap)
                     # Record snapshot if diagnostics recording is active
