@@ -106,6 +106,13 @@ HAUNT_DUAL: dict[tuple[int, int], tuple[int, int]] = {
     for j in range(HAUNT_FRAMES)
 }
 
+# ── Activity field ──────────────────────────────────────────────────────
+# A decaying map of recent change (births + deaths). This is how the
+# universe senses itself: the camera steers toward it, injections read it
+# to find dead zones and living targets, the music pans with it, and time
+# dilation listens for its spikes. Half-life ≈ 34 steps at 0.98.
+ACTIVITY_DECAY: float = 0.98
+
 # ── Half-block characters ───────────────────────────────────────────────
 UPPER_HALF = "\u2580"  # ▀  top pixel alive
 LOWER_HALF = "\u2584"  # ▄  bottom pixel alive
@@ -941,6 +948,11 @@ class InfiniteLife:
             (self.world_h, self.world_w), dtype=np.float32
         )
 
+        # Activity field: decaying map of recent change (see ACTIVITY_DECAY)
+        self.activity: NDArray[np.float32] = np.zeros(
+            (self.world_h, self.world_w), dtype=np.float32
+        )
+
         # Bounding box from last step() — reused by _calculate_target_zoom()
         self._step_bbox: tuple[int, int, int, int] | None = None
 
@@ -1094,9 +1106,17 @@ class InfiniteLife:
             birth_r = ~g_bool_r & n_is_3
             survive_r = g_bool_r & (n_is_3 | (n_region == 2))
 
+            # Change mask (births + deaths) — must be computed before the
+            # grid write below, because g_bool_r is a view of the grid
+            change_r = birth_r | (g_bool_r & ~survive_r)
+
             # Write updated grid back into sub-region
             np.add(birth_r.view(np.int8), survive_r.view(np.int8),
                    out=self.grid[by0:by1, bx0:bx1])
+
+            # Activity field: decay everywhere, deposit where cells changed
+            self.activity *= ACTIVITY_DECAY
+            self.activity[by0:by1, bx0:bx1] += change_r
 
             # Age tracking on sub-region only
             age_r = self.age[by0:by1, bx0:bx1]
@@ -1130,7 +1150,14 @@ class InfiniteLife:
             birth = ~g_bool & n_is_3
             survive = g_bool & (n_is_3 | (n == 2))
 
+            # Change mask before the grid write (g_bool aliases the grid)
+            change = birth | (g_bool & ~survive)
+
             np.add(birth.view(np.int8), survive.view(np.int8), out=self.grid)
+
+            # Activity field: decay everywhere, deposit where cells changed
+            self.activity *= ACTIVITY_DECAY
+            self.activity += change
             if self.haunted:
                 # The resurrected bug: no `age < 0` guard, so never-alive
                 # cells (age 0) fall into the decay branch too and the whole
@@ -1362,6 +1389,26 @@ class InfiniteLife:
         x0 = max(0, self.cam_x - pad)
         x1 = min(self.world_w, self.cam_x + self.view_w + pad)
 
+        # Steer toward drama: centroid of squared activity (squaring
+        # emphasizes hotspots — an explosion outweighs a blinker farm).
+        # Falls back to the population centroid when the region is calm.
+        act = self.activity[y0:y1, x0:x1]
+        act_sq_rows = (act * act).sum(axis=1)
+        act_total = float(act_sq_rows.sum())
+        if act_total > 25.0:
+            act_sq_cols = (act * act).sum(axis=0)
+            cy = float((act_sq_rows * np.arange(act_sq_rows.shape[0])).sum() / act_total)
+            cx = float((act_sq_cols * np.arange(act_sq_cols.shape[0])).sum() / act_total)
+            target_y = int(cy) + y0 - self.view_h // 2
+            target_x = int(cx) + x0 - self.view_w // 2
+            target_y = max(0, min(target_y, self.world_h - self.view_h))
+            target_x = max(0, min(target_x, self.world_w - self.view_w))
+
+            self.cam_y = int(self.cam_y + (target_y - self.cam_y) * 0.04)
+            self.cam_x = int(self.cam_x + (target_x - self.cam_x) * 0.04)
+            self._advance_auto_zoom()
+            return
+
         region = self.grid[y0:y1, x0:x1]
         total = region.sum()
         if total > 0:
@@ -1374,8 +1421,13 @@ class InfiniteLife:
             self.cam_y = int(self.cam_y + (target_y - self.cam_y) * 0.04)
             self.cam_x = int(self.cam_x + (target_x - self.cam_x) * 0.04)
 
-        # Auto-zoom: gradually step toward optimal zoom level
-        # Throttle: only recalculate every 4th frame when cooldown is 0
+        self._advance_auto_zoom()
+
+    def _advance_auto_zoom(self) -> None:
+        """Auto-zoom: gradually step toward optimal zoom level.
+
+        Throttled: only recalculates every 4th frame when cooldown is 0.
+        """
         self._zoom_cooldown = max(0, self._zoom_cooldown - 1)
         if self._zoom_cooldown == 0 and self.generation % 4 == 0:
             target_z = self._calculate_target_zoom()
@@ -1846,6 +1898,27 @@ class InfiniteLife:
     def population(self) -> int:
         return self._cached_pop
 
+    def activity_center_x(self) -> float:
+        """Horizontal centroid of viewport activity, 0.0 (left) – 1.0 (right).
+
+        Feeds the music engine's stereo field: the arpeggio pans toward
+        where the universe is actually changing. 0.5 when calm.
+        """
+        y0, x0 = self._clamp_cam()
+        region = self.activity[y0 : y0 + self.view_h, x0 : x0 + self.view_w]
+        cols = region.sum(axis=0)
+        total = float(cols.sum())
+        if total < 1.0 or cols.shape[0] < 2:
+            return 0.5
+        idx = float((cols * np.arange(cols.shape[0], dtype=np.float32)).sum())
+        return idx / total / (cols.shape[0] - 1)
+
+    def viewport_activity(self) -> float:
+        """Total activity in the viewport (drama meter for time dilation)."""
+        y0, x0 = self._clamp_cam()
+        region = self.activity[y0 : y0 + self.view_h, x0 : x0 + self.view_w]
+        return float(region.sum())
+
     def sparkline(self, width: int = 24) -> str:
         ph_len = len(self.pop_history)
         if ph_len < 2:
@@ -2294,6 +2367,7 @@ def main(stdscr: curses.window) -> None:
                         playhead_position=playhead_pos,
                         viewport_rows=disp.shape[0],
                         event=event,
+                        activity_x=life.activity_center_x(),
                     )
                     music.update(snap)
                     # Record snapshot if diagnostics recording is active

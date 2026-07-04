@@ -122,6 +122,7 @@ class SimulationSnapshot:
     playhead_position: float = 0.0
     viewport_rows: int = 40
     event: str = ""  # last injection event string ("" = none this frame)
+    activity_x: float = 0.5  # horizontal centroid of recent change (0-1)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -927,12 +928,15 @@ class LifeMusicEngine:
         drone, melody, arp, noise, cadence, ramps = self._render_layers(n_samples)
         drone_ramp, melody_ramp, arp_ramp, noise_ramp = ramps
 
-        # Pan targets (0 = hard left, 1 = hard right)
+        # Pan targets (0 = hard left, 1 = hard right). The melody follows
+        # the playhead; the arpeggio leans toward where the universe is
+        # actually changing, with a slow LFO wobble on top.
         melody_pan = min(1.0, max(0.0, self._snapshot.playhead_position))
         self._autopan_phase = (
             self._autopan_phase + TWO_PI * n_samples / SAMPLE_RATE / 13.0
         ) % TWO_PI
-        arp_pan = 0.5 + 0.35 * math.sin(self._autopan_phase)
+        arp_pan = min(1.0, max(0.0,
+            self._snapshot.activity_x + 0.12 * math.sin(self._autopan_phase)))
 
         # Constant-power gain ramps from the previous buffer's pan position
         half_pi = math.pi / 2.0
