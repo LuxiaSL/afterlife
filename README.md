@@ -50,7 +50,7 @@ A news ticker scrolls context-aware musings across the bottom of the screen:
 | `z` / `x` | Zoom out / in | `f` | Auto-focus mode |
 | `s` | Stats overlay | `d` | Snapshot recording |
 | `m` | Mute / unmute music | `v` | Cycle style (chiptune / ambient) |
-| `[` / `]` | Volume down / up | | |
+| `[` / `]` | Volume down / up | `g` | **Haunted mode** |
 
 ## Music
 
@@ -64,6 +64,20 @@ The simulation *sonifies itself*. A generative music engine reads the grid state
 Two styles are available — **chiptune** (square waves, NES nostalgia) and **ambient** (sine waves, reverb-like decay). Press `v` to switch. Press `m` to mute.
 
 Music requires `pyaudio` (and a working audio device). If unavailable, the simulation runs silently.
+
+## Haunted Mode
+
+Press `g` and the universe remembers everything.
+
+<p align="center">
+  <img src="haunted.gif" alt="haunted mode" width="800">
+</p>
+
+An early version of this program had two bugs that conspired into something beautiful. The ghost-trail decay was missing an `age < 0` guard, so every cell that had *never lived* was treated as freshly dead — the entire empty universe cycled through ghost states in synchrony, forever. And on terminals with extended color-pair support, the ghost color pairs (ids 463–504) overflowed the 8-bit pair field in the curses attribute word, aliasing into the gradient's dual-color table: the void rendered magenta and orange instead of dim gray.
+
+The result: the whole world strobes through a seven-phase heartbeat — black, magenta-on-indigo, solid magenta, magenta-on-orange — and any cell a glider ever crossed is knocked out of phase with the global cycle, leaving its path visible *forever* as a phase-contrast trail. The screen becomes a long-exposure photograph of everything that ever happened.
+
+The bug was fixed, the file was lost, and the screenshots haunted us. Haunted mode is a resurrection: the exact physics of the missing guard, and the exact colors the pair-aliasing produced, reconstructed from an archaeological dig through an old copy of the file — reintroduced deliberately this time. The dead ticker musings know: *the grid forgets nothing — literally, now.*
 
 ## Requirements
 

@@ -68,6 +68,7 @@ MOOD_SCALE: dict[str, str] = {
     "sparse":    "minor_pentatonic",
     "dense":     "mixolydian",
     "injection": "major_pentatonic",
+    "haunted":   "whole_tone",     # no tonal center — nothing resolves
 }
 DEFAULT_SCALE: str = "major_pentatonic"
 

@@ -19,6 +19,7 @@
     +/-       speed              arrows    pan
     h         home (auto-cam)    mouse     toggle cells
     z/x       zoom out / in      f         toggle auto-focus mode
+    g         haunted mode (resurrects a beautiful old bug)
     s         toggle stats overlay
     d         toggle snapshot recording (for music diagnostics)
     m         mute / unmute music
@@ -70,6 +71,36 @@ GRADIENT: list[int] = [
 # Ghost trail colors (very dim, nearly black - just a hint of motion)
 GHOST_COLORS: list[int] = [236, 234]  # 2 frames, very subtle
 GHOST_FRAMES: int = len(GHOST_COLORS)
+
+# ── Haunted mode: a resurrected bug ─────────────────────────────────────
+# An early version of this file had no `age < 0` guard on ghost decay, so
+# every never-alive cell cycled 0 → -1 → … → -6 → 0 forever: the entire
+# empty universe pulsed as synchronized ghosts. On terminals with extended
+# color pairs, the ghost pair ids (463–504) then overflowed the 8-bit pair
+# field in the curses attr word and aliased into the gradient dual-pair
+# table — painting the void magenta and orange, and leaving every glider's
+# path visible forever as a phase-shifted trail. The tables below encode
+# the exact colors that aliasing produced, on purpose this time.
+HAUNT_FRAMES: int = 6
+# The 21-color gradient of the era, needed to decode the aliased pairs
+_HAUNT_ERA_GRADIENT: list[int] = [
+    17, 18, 19, 20, 21, 57, 56, 93, 129, 165, 164,
+    163, 198, 204, 203, 209, 208, 214, 220, 229, 231,
+]
+# Single ghost over true emptiness: pairs 463–468 → dual table idx 185+i
+HAUNT_SINGLE: list[tuple[int, int]] = [
+    (_HAUNT_ERA_GRADIENT[(185 + i) // 21], _HAUNT_ERA_GRADIENT[(185 + i) % 21])
+    for i in range(HAUNT_FRAMES)
+]
+# Ghost over ghost (top phase, bottom phase): pairs 469–504 → idx 191+i*6+j
+HAUNT_DUAL: dict[tuple[int, int], tuple[int, int]] = {
+    (i, j): (
+        _HAUNT_ERA_GRADIENT[(191 + i * 6 + j) // 21],
+        _HAUNT_ERA_GRADIENT[(191 + i * 6 + j) % 21],
+    )
+    for i in range(HAUNT_FRAMES)
+    for j in range(HAUNT_FRAMES)
+}
 
 # ── Convolution kernel (reused every step) ────────────────────────────
 NEIGHBOR_KERNEL: NDArray = np.array([[1, 1, 1], [1, 0, 1], [1, 1, 1]], dtype=np.int16)
@@ -359,6 +390,23 @@ MUSINGS_BY_STATE: dict[str, list[str]] = {
         "a digit rolls over; the grid doesn't notice",
         "epochal",
     ],
+    "haunted": [
+        "the dead outnumber the living, and glow",
+        "every path ever walked, still visible",
+        "the void remembers being alive",
+        "phase-contrast photography of the past",
+        "nothing is ever really deleted",
+        "the grid forgets nothing — literally, now",
+        "a bug so beautiful it became a feature",
+        "the ghosts have synchronized their breathing",
+        "somewhere between pair 463 and 504",
+        "resurrection as a rendering artifact",
+        "the afterlife was here all along",
+        "history, strobing",
+        "every empty cell, a metronome",
+        "the universe develops like a photograph",
+        "magenta is the color of memory",
+    ],
 }
 
 # ── Epochs ─────────────────────────────────────────────────────────────
@@ -593,6 +641,8 @@ class ColorMap:
     _dual_pairs: dict[tuple[int, int], int] = field(default_factory=dict)
     _ghost_pairs: dict[int, int] = field(default_factory=dict)
     _ghost_dual_pairs: dict[tuple[int, int], int] = field(default_factory=dict)
+    _haunt_pairs: dict[int, int] = field(default_factory=dict)
+    _haunt_dual_pairs: dict[tuple[int, int], int] = field(default_factory=dict)
 
     def setup(self) -> None:
         curses.start_color()
@@ -634,6 +684,22 @@ class ColorMap:
                 self._ghost_dual_pairs[(i, j)] = pair_id
                 pair_id += 1
 
+        # Haunted-mode pairs: the exact colors the historical pair-id
+        # aliasing produced (see HAUNT_* tables). 6 + 36 pairs.
+        for i, (fg, bg) in enumerate(HAUNT_SINGLE):
+            if pair_id > max_pairs:
+                break
+            curses.init_pair(pair_id, fg, bg)
+            self._haunt_pairs[i] = pair_id
+            pair_id += 1
+
+        for (i, j), (fg, bg) in HAUNT_DUAL.items():
+            if pair_id > max_pairs:
+                break
+            curses.init_pair(pair_id, fg, bg)
+            self._haunt_dual_pairs[(i, j)] = pair_id
+            pair_id += 1
+
         self.n_gradient = g
 
     def fg(self, color_idx: int) -> int:
@@ -647,6 +713,12 @@ class ColorMap:
 
     def ghost_dual(self, top_idx: int, bot_idx: int) -> int:
         return self._ghost_dual_pairs.get((top_idx, bot_idx), 0)
+
+    def haunt_fg(self, ghost_idx: int) -> int:
+        return self._haunt_pairs.get(ghost_idx, 0)
+
+    def haunt_dual(self, top_idx: int, bot_idx: int) -> int:
+        return self._haunt_dual_pairs.get((top_idx, bot_idx), 0)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -735,6 +807,10 @@ class InfiniteLife:
 
         # Bounding box from last step() — reused by _calculate_target_zoom()
         self._step_bbox: tuple[int, int, int, int] | None = None
+
+        # Haunted mode: resurrects the historical ghost-decay bug (see
+        # HAUNT_* constants). Toggled with 'g'.
+        self.haunted: bool = False
 
         self._seed_initial()
 
@@ -840,6 +916,11 @@ class InfiniteLife:
         else:
             use_bbox = False
 
+        # Haunted mode keeps (nearly) every cell's age in motion — the
+        # bbox path would freeze ages outside the box, so always take the
+        # full-world path.
+        use_bbox = use_bbox and not self.haunted
+
         # Store bbox for reuse by _calculate_target_zoom()
         self._step_bbox = (by0, by1, bx0, bx1) if has_activity and use_bbox else None
 
@@ -892,15 +973,12 @@ class InfiniteLife:
             age_f32_r *= 0.15
             self.age_smooth[by0:by1, bx0:bx1] += age_f32_r
         else:
-            # ── Full-world path (fallback for edge-touching or dense worlds) ──
-            # Neighbour count via convolution (toroidal wrap-around)
+            # ── Full-world path (fallback for very dense or empty worlds) ──
             if _convolve is not None:
-                # Reuse pre-allocated input + output buffers (avoids per-frame allocations)
                 np.copyto(self._grid_i16, g)
                 _convolve(self._grid_i16, NEIGHBOR_KERNEL, output=self._neighbor_buf, mode="wrap")
                 n = self._neighbor_buf
             else:
-                # Fallback: manual shift-and-add with np.roll for toroidal wrap
                 n = np.zeros_like(g, dtype=np.int16)
                 for dr in (-1, 0, 1):
                     for dc in (-1, 0, 1):
@@ -908,26 +986,30 @@ class InfiniteLife:
                             continue
                         n += np.roll(np.roll(g, -dr, axis=0), -dc, axis=1)
 
-            # Use zero-copy bool view of int8 grid (avoids g==0 / g==1 comparisons)
             g_bool = g.view(np.bool_)
             n_is_3 = n == 3
             birth = ~g_bool & n_is_3
             survive = g_bool & (n_is_3 | (n == 2))
 
-            # In-place grid update (birth/survive are mutually exclusive,
-            # so add their int8 views: 0+0=0, 1+0=1, 0+1=1)
             np.add(birth.view(np.int8), survive.view(np.int8), out=self.grid)
-            # Age tracking with ghost trails: positive = alive, negative = recently dead
-            # Note: inner condition requires age < 0 to avoid turning never-alive
-            # empties (age==0) into false ghosts (0 > -GHOST_FRAMES was true → bug)
-            self.age = np.where(
-                survive, self.age + 1,
-                np.where(birth, 1,
-                np.where(self.age > 0, -1,  # just died → start ghost
-                np.where((self.age < 0) & (self.age > -GHOST_FRAMES), self.age - 1, 0)))
-            )
-            # Temporal smoothing: in-place ops avoid 3 large temporary allocations
-            np.copyto(self._age_f32_buf, self.age)  # int32 → float32
+            if self.haunted:
+                # The resurrected bug: no `age < 0` guard, so never-alive
+                # cells (age 0) fall into the decay branch too and the whole
+                # empty universe cycles 0 → -1 → … → -HAUNT_FRAMES → 0.
+                self.age = np.where(
+                    survive, self.age + 1,
+                    np.where(birth, 1,
+                    np.where(self.age > 0, -1,
+                    np.where(self.age > -HAUNT_FRAMES, self.age - 1, 0)))
+                )
+            else:
+                self.age = np.where(
+                    survive, self.age + 1,
+                    np.where(birth, 1,
+                    np.where(self.age > 0, -1,
+                    np.where((self.age < 0) & (self.age > -GHOST_FRAMES), self.age - 1, 0)))
+                )
+            np.copyto(self._age_f32_buf, self.age)
             self._age_f32_buf *= 0.15
             self.age_smooth *= 0.85
             self.age_smooth += self._age_f32_buf
@@ -1253,10 +1335,14 @@ class InfiniteLife:
         Slices the viewport region FIRST, then rounds — avoids rounding
         the entire 590×1000 world array when only a small viewport is needed.
         """
+        # Haunted mode renders raw ages: the ghost phase cycle IS the
+        # visual — temporal smoothing would blur the strobe into mush.
+        age_src: NDArray = self.age if self.haunted else self.age_smooth
+
         if self.zoom_level == 0:
             y0, x0 = self._clamp_cam()
-            region_smooth = self.age_smooth[y0 : y0 + self.view_h, x0 : x0 + self.view_w]
-            return np.round(region_smooth).astype(np.int32)
+            region_src = age_src[y0 : y0 + self.view_h, x0 : x0 + self.view_w]
+            return region_src.astype(np.int32)
 
         cy, cx = self._view_center()
 
@@ -1270,11 +1356,11 @@ class InfiniteLife:
 
             if cover_h > self.world_h or cover_w > self.world_w:
                 y0b, x0b = self._clamp_cam()
-                region_smooth = self.age_smooth[y0b : y0b + self.view_h, x0b : x0b + self.view_w]
-                return np.round(region_smooth).astype(np.int32)
+                region_src = age_src[y0b : y0b + self.view_h, x0b : x0b + self.view_w]
+                return region_src.astype(np.int32)
 
-            region_smooth = self.age_smooth[y0 : y0 + cover_h, x0 : x0 + cover_w]
-            region = np.round(region_smooth).astype(np.int32)
+            region_src = age_src[y0 : y0 + cover_h, x0 : x0 + cover_w]
+            region = region_src.astype(np.int32)
             bh = cover_h // factor
             bw = cover_w // factor
             trimmed = region[: bh * factor, : bw * factor]
@@ -1284,7 +1370,7 @@ class InfiniteLife:
             max_vals = blocks.max(axis=(1, 3))
             # For ghost detection, mask zeros so we can find the max of negative values only
             # Sentinel value more negative than any valid ghost age
-            sentinel = -GHOST_FRAMES - 1
+            sentinel = -(HAUNT_FRAMES if self.haunted else GHOST_FRAMES) - 1
             masked = np.where(trimmed != 0, trimmed, sentinel)
             ghost_max = masked.reshape(bh, factor, bw, factor).max(axis=(1, 3))
             # Use max if alive; else ghost_max if valid ghost exists; else 0
@@ -1298,8 +1384,8 @@ class InfiniteLife:
             y0 = max(0, min(cy - cover_h // 2, self.world_h - cover_h))
             x0 = max(0, min(cx - cover_w // 2, self.world_w - cover_w))
 
-            region_smooth = self.age_smooth[y0 : y0 + cover_h, x0 : x0 + cover_w]
-            region = np.round(region_smooth).astype(np.int32)
+            region_src = age_src[y0 : y0 + cover_h, x0 : x0 + cover_w]
+            region = region_src.astype(np.int32)
             up = np.repeat(np.repeat(region, factor, axis=0), factor, axis=1)
             return up[: self.view_h, : self.view_w]
 
@@ -1426,6 +1512,17 @@ class InfiniteLife:
         self.pop_history.clear()
         self.hash_history.clear()
 
+    def toggle_haunted(self) -> None:
+        """Toggle haunted mode (the resurrected ghost-decay bug)."""
+        self.haunted = not self.haunted
+        self._disp_grid_cache = None
+        self._disp_age_cache = None
+        if not self.haunted:
+            # Exorcism: normal-mode decay can't retire ghosts older than
+            # -GHOST_FRAMES (they'd be stuck forever), so clear them all.
+            self.age[self.age < 0] = 0
+            self.age_smooth[self.age_smooth < 0] = 0.0
+
     def toggle_cell(self, term_y: int, term_x: int) -> None:
         """Toggle a cell at terminal coordinates, accounting for zoom."""
         cy, cx = self._view_center()
@@ -1475,6 +1572,10 @@ class InfiniteLife:
 
     def _compute_mood(self) -> str:
         """Internal mood computation (called once per generation)."""
+        # Haunted mode possesses everything, including the ticker
+        if self.haunted:
+            return "haunted"
+
         # Recent injection gets priority (show for ~90 frames after event)
         if self.last_event and (self.generation - self.last_event_gen) < 90:
             return "injection"
@@ -1574,6 +1675,25 @@ def ghost_color_idx(ghost_age: int) -> int:
     return max(0, idx)
 
 
+_lut_cache: tuple[int, int, NDArray] | None = None
+
+
+def _get_color_lut(max_age: int, ng: int) -> NDArray:
+    """Return cached color LUT, rebuilding only when max_age or ng changes."""
+    global _lut_cache
+    if _lut_cache is not None and _lut_cache[0] == max_age and _lut_cache[1] == ng:
+        return _lut_cache[2]
+    lut_size = max_age + 1
+    ages_1d = np.arange(lut_size, dtype=np.float64)
+    log_max = math.log1p(max_age)
+    color_lut = np.minimum(
+        (np.log1p(ages_1d) / log_max * (ng - 1)).astype(np.intp), ng - 1
+    )
+    color_lut[0] = 0
+    _lut_cache = (max_age, ng, color_lut)
+    return color_lut
+
+
 def render(
     stdscr: curses.window,
     life: InfiniteLife,
@@ -1600,17 +1720,13 @@ def render(
     max_age = max(int(ages.max()), 1)
     ng = cmap.n_gradient
 
-    # Pre-compute age→color lookup table (replaces per-cell math.log1p calls)
-    lut_size = max_age + 1
-    ages_1d = np.arange(lut_size, dtype=np.float64)
-    log_max = math.log1p(max_age)
-    color_lut = np.minimum(
-        (np.log1p(ages_1d) / log_max * (ng - 1)).astype(np.intp), ng - 1
-    )
-    color_lut[0] = 0
+    # Pre-compute age→color lookup table (cached — only rebuilt when max_age changes)
+    color_lut = _get_color_lut(max_age, ng)
 
-    # Disable ghost rendering when zoomed out - too much visual noise
-    show_ghosts = life.zoom_level >= 0
+    # Disable ghost rendering when zoomed out - too much visual noise.
+    # Haunted mode inverts that judgment: the noise is the exhibit.
+    show_ghosts = life.zoom_level >= 0 or life.haunted
+    ghost_frames = HAUNT_FRAMES if life.haunted else GHOST_FRAMES
 
     # ── Vectorized pre-computation ────────────────────────────────
     row_end = draw_rows * 2
@@ -1633,8 +1749,8 @@ def render(
     # Color indices: vectorized clip + LUT (replaces per-cell max/min/ghost_color_idx)
     top_cidx = color_lut[np.clip(top_ages, 0, max_age)]
     bot_cidx = color_lut[np.clip(bot_ages, 0, max_age)]
-    top_gidx = np.clip(-top_ages - 1, 0, GHOST_FRAMES - 1)
-    bot_gidx = np.clip(-bot_ages - 1, 0, GHOST_FRAMES - 1)
+    top_gidx = np.clip(-top_ages - 1, 0, ghost_frames - 1)
+    bot_gidx = np.clip(-bot_ages - 1, 0, ghost_frames - 1)
 
     # Get active cell positions — only iterate cells that need drawing
     active_ys, active_xs = np.nonzero(active_mask)
@@ -1664,8 +1780,12 @@ def render(
     _BOLD = curses.A_BOLD
     _dual = cmap.dual
     _fg = cmap.fg
-    _ghost_dual = cmap.ghost_dual
-    _ghost_fg = cmap.ghost_fg
+    if life.haunted:
+        _ghost_dual = cmap.haunt_dual
+        _ghost_fg = cmap.haunt_fg
+    else:
+        _ghost_dual = cmap.ghost_dual
+        _ghost_fg = cmap.ghost_fg
 
     for i in range(n_active):
         try:
@@ -1711,9 +1831,10 @@ def render(
 
     epoch = life.epoch()
     focus_indicator = "[F]" if life.auto_focus_mode else ""
+    haunt_indicator = "[HAUNTED]" if life.haunted else ""
     music_indicator = f" {music_status}" if music_status else ""
     left = f"  {epoch}  gen {life.generation:,}  pop {pop:,}  {spark}"
-    right = f"{music_indicator} {focus_indicator} {zoom_label} {cam}  q r spc +/- arrows h z/x f s  "
+    right = f"{music_indicator} {haunt_indicator}{focus_indicator} {zoom_label} {cam}  q r spc +/- arrows h z/x f g s  "
 
     # Ticker occupies the region between left stats and right controls
     ticker_col = len(left) + 1
@@ -1832,7 +1953,9 @@ def main(stdscr: curses.window) -> None:
                 break
             elif key in (ord("r"), ord("R")):
                 max_y, max_x = stdscr.getmaxyx()
+                was_haunted = life.haunted
                 life = InfiniteLife(max_y - 1, max_x)
+                life.haunted = was_haunted
                 _playhead_col_idx = 0
             elif key == ord(" "):
                 life.paused = not life.paused
@@ -1852,6 +1975,8 @@ def main(stdscr: curses.window) -> None:
                 life.auto_focus_mode = not life.auto_focus_mode
                 if life.auto_focus_mode:
                     life.auto_focus()  # Immediate first focus
+            elif key in (ord("g"), ord("G")):
+                life.toggle_haunted()
             elif key in (ord("s"), ord("S")):
                 show_stats = not show_stats
             elif key in (ord("d"), ord("D")):
@@ -1897,7 +2022,9 @@ def main(stdscr: curses.window) -> None:
                     pass
             elif key == curses.KEY_RESIZE:
                 max_y, max_x = stdscr.getmaxyx()
+                was_haunted = life.haunted
                 life = InfiniteLife(max_y - 1, max_x)
+                life.haunted = was_haunted
                 _playhead_col_idx = 0
 
             # ── Simulate ───────────────────────────────────────────
