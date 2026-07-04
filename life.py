@@ -110,8 +110,13 @@ HAUNT_DUAL: dict[tuple[int, int], tuple[int, int]] = {
 # A decaying map of recent change (births + deaths). This is how the
 # universe senses itself: the camera steers toward it, injections read it
 # to find dead zones and living targets, the music pans with it, and time
-# dilation listens for its spikes. Half-life ≈ 34 steps at 0.98.
+# dilation listens for its spikes. Half-life ≈ 34 steps at 0.98/step.
+# The decay multiply touches the whole world, so it's batched: applied
+# every ACTIVITY_DECAY_EVERY steps at DECAY^EVERY (same integral, 1/4 the
+# memory traffic).
 ACTIVITY_DECAY: float = 0.98
+ACTIVITY_DECAY_EVERY: int = 4
+ACTIVITY_DECAY_BATCH: float = ACTIVITY_DECAY ** ACTIVITY_DECAY_EVERY
 
 # ── Half-block characters ───────────────────────────────────────────────
 UPPER_HALF = "\u2580"  # ▀  top pixel alive
@@ -1114,8 +1119,7 @@ class InfiniteLife:
             np.add(birth_r.view(np.int8), survive_r.view(np.int8),
                    out=self.grid[by0:by1, bx0:bx1])
 
-            # Activity field: decay everywhere, deposit where cells changed
-            self.activity *= ACTIVITY_DECAY
+            # Activity field: deposit where cells changed (batched decay below)
             self.activity[by0:by1, bx0:bx1] += change_r
 
             # Age tracking on sub-region only
@@ -1155,8 +1159,7 @@ class InfiniteLife:
 
             np.add(birth.view(np.int8), survive.view(np.int8), out=self.grid)
 
-            # Activity field: decay everywhere, deposit where cells changed
-            self.activity *= ACTIVITY_DECAY
+            # Activity field: deposit where cells changed (batched decay below)
             self.activity += change
             if self.haunted:
                 # The resurrected bug: no `age < 0` guard, so never-alive
@@ -1181,6 +1184,10 @@ class InfiniteLife:
             self.age_smooth += self._age_f32_buf
 
         self.generation += 1
+
+        # Batched activity decay (see ACTIVITY_DECAY_EVERY)
+        if self.generation % ACTIVITY_DECAY_EVERY == 0:
+            self.activity *= ACTIVITY_DECAY_BATCH
 
         pop = int(np.count_nonzero(self.grid))
         self._cached_pop = pop
